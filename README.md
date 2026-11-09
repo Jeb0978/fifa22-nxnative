@@ -47,7 +47,7 @@ Supply the base game and matching 1.0.5 update in one game folder. The build use
 
 ### 1. Set up the tools
 
-Use a Mac with the Xcode and Metal toolchain required by this checkout, Python 3.12 or newer, and the supporting build dependencies. Follow the [upstream command-line setup](README.upstream.md#build-from-the-command-line), using this fork as your checkout.
+Use a Mac with [Xcode](https://developer.apple.com/xcode/) 27.1, Python 3.12 or newer, and the supporting build dependencies. The Metal compiler must also match the version recorded in [`dmsh_chain.lock`](dm/gfx/tools/dmsh_chain.lock); the Xcode version alone does not guarantee the exact compiler build. Check it with `python3 dm/gfx/tools/own_compilers.py --check-metal`, and follow the [upstream command-line setup](README.upstream.md#build-from-the-command-line), using this fork as your checkout.
 
 ### 2. Build your game
 
