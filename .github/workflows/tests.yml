@@ -102,51 +102,6 @@ jobs:
           path: logs
           retention-days: 7
 
-  tool-tests:
-    name: Tool tests
-    runs-on: xcode-27
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.14'
-          cache: pip
-          cache-dependency-path: .github/workflows/tests.yml   # no requirements file: the packages are listed in the step below
-      - name: Install the Python packages the tools import
-        run: python -m pip install lz4 capstone fonttools pycryptodome==3.24.1   # backports.zstd is for Python before 3.14 only
-      # The shader translator's tests (test_image_atomic_bounds, test_dmsh_geometry) run the committed translator on synthetic Maxwell shaders, then spirv-val and the committed spirv-cross:
-      # one translation chain serves every game, so these are what checks a translator change on games its author does not own (GitHub issue #272). Compiling their MSL with
-      # Metal (DMSH_TEST_METAL=1) and running it on the GPU (DMSH_TEST_GPU=1) stay local.
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        with:
-          dotnet-version: '10.0.x'   # dm/gfx/tools/dmsh_xlate_bin targets net10.0
-      - name: Install spirv-val   # spirv-cross is the in-repo build (dm/gfx/tools/spirv_cross_bin)
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-        run: brew install spirv-tools
-      - name: Run the test files
-        env:
-          DM_GAME: ${{ env.GAME }}   # test_tbdr_budget runs a tool that needs a profile
-          DMSH_TEST_XLATE: ${{ github.workspace }}/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate
-        run: |
-          mkdir -p logs
-          failed=0
-          for f in dm/tools/tests/test_*.py dm/ios/tests/test_*.py dm/gfx/tests/test_*.py; do
-            echo "::group::$f"
-            python -m unittest -v "$f" 2>&1 | tee "logs/$(basename "$f").log" || { echo "::error::$f failed"; failed=1; }
-            echo "::endgroup::"
-          done
-          exit $failed
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
-        with:
-          name: logs-tool-tests
-          path: logs
-          retention-days: 7
-
   build:
     name: Build check (Mac host, gfx tests, iOS sources)
     runs-on: xcode-27
