@@ -11,7 +11,7 @@ import tempfile
 gfx = Path(__file__).resolve().parents[1]
 source = (gfx / 'nvn/nvn_mtl.m').read_text(encoding='utf-8')
 start = source.index('static int bc_source_ready(')
-end = source.index('\nstatic void copy_b2t(', start)
+end = source.index('\n}', start) + 2
 gate = source[start:end]
 test = r'''
 #include <stdint.h>

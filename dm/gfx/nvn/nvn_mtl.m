@@ -57,6 +57,7 @@ static uint64_t c2_handle(int stage, unsigned b);   // the handle c2 holds at by
 #include <libkern/OSByteOrder.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <dispatch/dispatch.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9672,6 +9673,44 @@ static int bc_source_ready(uint64_t addr, uint64_t size) {
     static int once; if (!once++) MLOG("software BC upload: waited for GPU-written source before decoding");
     return 1;
 }
+// The A16 software-BC fallback can decode directly into a shared Metal blit
+// buffer. Large uploads use independent 4-texel-row stripes, then join before
+// the GPU copy is encoded. The producer wait in bc_source_ready still runs FIRST.
+// DM_NVN_BC_THREADS=1 disables parallelism for an apples-to-apples phone test.
+static void bc_decode_upload(int f, uint32_t w, uint32_t h, int nz,
+                             const uint8_t *src, size_t src_img, size_t src_row,
+                             uint8_t *dst, size_t dst_img, size_t dst_row) {
+    static int requested = -1;
+    if (requested < 0) {
+        const char *e = getenv("DM_NVN_BC_THREADS");
+        int n = e ? atoi(e) : 0;
+        requested = n >= 1 && n <= 4 ? n : 0;
+    }
+    const size_t bytes = dst_img * (size_t)nz;
+    const uint32_t block_rows = (h + 3) / 4;
+    int workers = requested ? requested : bytes >= (16u << 20) ? 3 : bytes >= (4u << 20) ? 2 : 1;
+    if (workers > (int)block_rows) workers = (int)block_rows;
+    if (workers <= 1) {
+        for (int z = 0; z < nz; z++)
+            nvn_bc_decompress_level_strided(f, w, h, src + z * src_img, src_row,
+                                            dst + z * dst_img, dst_row);
+        return;
+    }
+    static int logged;
+    if (!logged++) MLOG("BC decode: %d parallel stripes per layer for %zu output bytes (DM_NVN_BC_THREADS=1 disables)", workers, bytes);
+    const size_t lanes = (size_t)workers;
+    dispatch_apply(lanes * (size_t)nz, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t job) {
+        size_t z = job / lanes, part = job % lanes;
+        uint32_t by0 = (uint32_t)((block_rows * part) / lanes);
+        uint32_t by1 = (uint32_t)((block_rows * (part + 1)) / lanes);
+        if (by1 == by0) return;
+        uint32_t y0 = by0 * 4;
+        uint32_t band_h = MIN(h - y0, (by1 - by0) * 4);
+        nvn_bc_decompress_level_strided(f, w, band_h,
+             src + z * src_img + (size_t)by0 * src_row, src_row,
+             dst + z * dst_img + (size_t)y0 * dst_row, dst_row);
+    });
+}
 static void copy_b2t(const p_copy_b2t *c) {
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
@@ -9703,26 +9742,25 @@ static void copy_b2t(const p_copy_b2t *c) {
         int uncomp_bpp = nvn_bc_decompressed_bpp(c->tex->d.format);
         size_t uncomp_row = (size_t)c->r.width * uncomp_bpp;
         size_t uncomp_img = uncomp_row * c->r.height;
-        uint8_t *uncomp_buf = malloc(uncomp_img * nz);
-        if (uncomp_buf) {
-            for (int z = 0; z < nz; z++) {
-                const uint8_t *src_slice = (const uint8_t *)((__bridge id<MTLBuffer>)mb).contents + mo + z * img;
-                uint8_t *dst_slice = uncomp_buf + z * uncomp_img;
-                nvn_bc_decompress_level_strided(c->tex->d.format, c->r.width, c->r.height, src_slice, row, dst_slice, uncomp_row);
-            }
-            id<MTLBuffer> ub = [g_dev newBufferWithBytes:uncomp_buf length:uncomp_img * nz options:MTLResourceStorageModeShared];
-            free(uncomp_buf);
-            if (ub) {
-                res_add(ub); defer_obj_release(ub);
-                if (is3d)
-                    enc_b_copy_buffer_texture(b, ub, 0, uncomp_row, uncomp_img, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));
-                else
-                    for (int z = 0; z < nz; z++)
-                        enc_b_copy_buffer_texture(b, ub, z * uncomp_img, uncomp_row, uncomp_img, MTLSizeMake(c->r.width, c->r.height, 1), t, layer0 + c->r.zoffset + z, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, 0));
-                if (rb) mirror_readback(c->tex, t, level, layer0, &c->r, "buffer");
-                return;
-            }
-        }
+        // A16: write decoded texels directly to Shared Metal memory. The old
+        // malloc -> decode -> newBufferWithBytes -> free path copied the entire
+        // uncompressed upload (often 12-28 MB) before encoding the GPU blit.
+        // Keep source synchronization and the original format/stride semantics.
+        if (uncomp_bpp <= 0 || !uncomp_img || nz <= 0 || (size_t)nz > SIZE_MAX / uncomp_img)
+            MDIE("software BC upload: invalid decompressed size");
+        id<MTLBuffer> ub = [g_dev newBufferWithLength:uncomp_img * (size_t)nz options:MTLResourceStorageModeShared];
+        if (!ub || !ub.contents) MDIE("software BC upload: cannot allocate decoded Metal buffer");
+        bc_decode_upload(c->tex->d.format, c->r.width, c->r.height, nz,
+                         (const uint8_t *)((__bridge id<MTLBuffer>)mb).contents + mo, img, row,
+                         (uint8_t *)ub.contents, uncomp_img, uncomp_row);
+        res_add(ub); defer_obj_release(ub);
+        if (is3d)
+            enc_b_copy_buffer_texture(b, ub, 0, uncomp_row, uncomp_img, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));
+        else
+            for (int z = 0; z < nz; z++)
+                enc_b_copy_buffer_texture(b, ub, z * uncomp_img, uncomp_row, uncomp_img, MTLSizeMake(c->r.width, c->r.height, 1), t, layer0 + c->r.zoffset + z, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, 0));
+        if (rb) mirror_readback(c->tex, t, level, layer0, &c->r, "buffer");
+        return;
     }
     if (is3d)
         enc_b_copy_buffer_texture(b, (__bridge id<MTLBuffer>)mb, mo, row, img, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));

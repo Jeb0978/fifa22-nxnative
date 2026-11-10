@@ -41,6 +41,37 @@ Captured on iPhone 15 (A16), running through LiveContainer.
 - **Lower allocation overhead:** texture lookup tables scale with the registered texture capacity instead of allocating the entire handle domain. A 2,048-entry table uses 16 KiB rather than 8 MiB, while preserving valid texture IDs and resource lifetimes.
 - **Separate game data:** a small IPA can reuse an external `romfs.img` across app updates.
 
+## BCfast texture-upload update
+
+BCfast builds on the original texture synchronization and descriptor-table fixes. It improves the A16 software BC upload path in two ways:
+
+- **Decode directly into a shared Metal buffer.** Removes the temporary decoded CPU image and the extra full-image copy into the upload buffer. For a 16 MiB decoded upload, this avoids one 16 MiB temporary allocation and a 16 MiB copy; the required Metal upload buffer remains.
+- **Decode large uploads in parallel.** Independent compressed-block rows are split across CPU workers. All workers finish before the GPU copy is encoded. Automatic selection uses one worker below 4 MiB of decoded upload data, two from 4 MiB to under 16 MiB, and three at 16 MiB or above, limited by the available block rows.
+
+The GPU-producer wait that fixed corrupted textures remains intact. Shader translation, descriptor-table sizing, game files, and the external-ROM format are unchanged. The goal is lower upload overhead and fewer loading stalls, not a higher frame-rate cap or reduced image quality.
+
+### Reported device results
+
+The unchanged BCfast build completed a full match over approximately **17 minutes / 58,500 frames**, sustaining roughly **60 FPS**, with no crash in that session. Parallel decoding was enabled. The comparison reported:
+
+| Observation | Original optimized build | BCfast |
+| --- | --- | --- |
+| Successful session duration | About 24 minutes | About 17 minutes |
+| Sustained gameplay | About 60 FPS | About 60 FPS |
+| Peak observed memory footprint | 3,995 MiB | 3,861 MiB |
+| Lowest reported memory headroom | About 100 MB | About 250 MB |
+| Time to thermal state 2 | 5 min 49 sec | 7 min 44 sec |
+
+These are maintainer-reported results from different gameplay sessions, not a controlled benchmark. The **134 MiB lower observed peak** is encouraging, but the entire difference cannot be attributed to BCfast. Starting temperature, brightness, and gameplay also affect thermal results. An earlier BCfast session crashed in guest game code; its underlying cause remains unresolved. The successful full match does not establish that all crash cases are fixed.
+
+### Compatibility and fallback
+
+If BCfast causes crashes, visual problems, or worse performance on your setup, use the **first release based on [commit `2e42250`](https://github.com/Jeb0978/fifa22-nxnative/commit/2e42250fdcdf1747371c2b7ee5b2450f6cb2ffd4)**. That version contains the working texture synchronization and descriptor-table optimizations without BCfast.
+
+For diagnosis, `DM_NVN_BC_THREADS=1` in the game's `Documents/env.txt` disables parallel decoding while retaining direct-to-Metal decoding. Values 2–4 override the worker count; without a valid override, selection is automatic. This setting is not a complete rollback—use the first-release source/build to remove both changes. Parallel work can increase short-term CPU load and heat.
+
+Keep the existing app data container when switching builds. The same game version uses the same `romfs.img`; no ROM replacement is needed for this update.
+
 ## Building
 
 Supply the base game and matching 1.0.5 update in one game folder. The build uses the included [FIFA build profile](fifa-build-profile/0100216014472000), which provides the memory configuration and shader/pipeline tables required by this port.
@@ -77,7 +108,14 @@ See [playing documentation](docs/playing.md) for controls, saves, and settings.
 
 ## Validation
 
-Validation included iOS shader compilation and argument-buffer layout checks, descriptor-index equivalence tests, texture synchronization regression tests, and IPA integrity checks. Relevant source tests include [descriptor bounds](dm/gfx/tests/test_raw_descriptor_bounds.py) and [BC source synchronization](dm/gfx/tests/test_bc_source_sync.py); each accepts a C compiler path.
+Validation included iOS shader compilation and argument-buffer layout checks, descriptor-index equivalence tests, texture synchronization regression tests, and IPA integrity checks. Relevant source tests include [descriptor bounds](dm/gfx/tests/test_raw_descriptor_bounds.py) and [BC source synchronization](dm/gfx/tests/test_bc_source_sync.py); each accepts a C compiler path. The [BC stripe equivalence test](dm/gfx/tests/test_bc_stripes.c) compares 1,120 cases across the supported BC formats, padded strides, 1–4 stripes, 1–3 layers, and partial edge blocks. It checks pixel equivalence, not Apple dispatch scheduling or Metal buffer lifetime.
+
+Run the stripe test with a C compiler (example for macOS):
+
+```bash
+cc -std=c11 -O2 dm/gfx/tests/test_bc_stripes.c dm/gfx/tex/nvn_bcdec.c -o /tmp/test_bc_stripes
+/tmp/test_bc_stripes
+```
 
 Performance figures describe the tested device and game version, rather than a benchmark across all hardware. Device temperature, settings, and loading activity can affect results.
 
